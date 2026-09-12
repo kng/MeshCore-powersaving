@@ -179,7 +179,9 @@ uint8_t SensorMesh::handleRequest(uint8_t perms, uint32_t sender_timestamp, uint
     telemetry.reset();
     telemetry.addVoltage(TELEM_CHANNEL_SELF, (float)board.getBattMilliVolts() / 1000.0f);
     // query other sensors -- target specific
-    if (sensors.getLocationProvider() != NULL && sensors.getLocationProvider()->isPowerSavingEnabled()) {
+    if (sensors.getLocationProvider() != NULL &&
+        sensors.getLocationProvider()->isPowerSavingEnabled() &&
+        getRTCClock()->getCurrentTime() > sensors.getLocationProvider()->getLastValidTimeSync() + 60) {
       sensors.getLocationProvider()->syncTime(); // Request for GPS sync if GPS is in PowerSaving
     }
     sensors.querySensors(0xFF & perm_mask, telemetry);  // allow all telemetry permissions for admin or guest

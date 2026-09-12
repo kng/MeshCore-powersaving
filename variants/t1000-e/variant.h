@@ -2,6 +2,7 @@
  * variant.h
  * Copyright (C) 2023 Seeed K.K.
  * MIT License
+ * Pin description: https://wiki.seeedstudio.com/get_started_with_lorawan_tracker/#pin-descriptions
  */
 
 #pragma once
@@ -19,7 +20,6 @@
 // Power
 
 #define NRF_APM                                 // detect usb power
-#define PIN_3V3_EN              (38)            // P1.6 Power to Sensors
 
 #define BATTERY_PIN             (2)             // P0.2/AIN0
 #define BATTERY_IMMUTABLE
@@ -120,7 +120,7 @@
 ////////////////////////////////////////////////////////////////////////////////
 // Temp+Lux Sensor
 
-#define SENSOR_EN               (4)             // P0.4
+#define SENSOR_EN               (38)            // P1.06
 #define TEMP_SENSOR             (31)            // P0.31/AIN7
 #define LUX_SENSOR              (29)            // P0.29/AIN5
 

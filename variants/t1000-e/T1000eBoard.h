@@ -14,17 +14,12 @@ public:
 
   uint16_t getBattMilliVolts() override {
   #ifdef BATTERY_PIN
-   #ifdef PIN_3V3_EN
-    digitalWrite(PIN_3V3_EN, HIGH);
-   #endif
+    digitalWrite(SENSOR_EN, HIGH);
     analogReference(AR_INTERNAL_3_0);
     analogReadResolution(12);
     delay(10);
     float volts = (analogRead(BATTERY_PIN) * ADC_MULTIPLIER * AREF_VOLTAGE) / 4096;
-   #ifdef PIN_3V3_EN
-    digitalWrite(PIN_3V3_EN, LOW);
-   #endif
-
+    digitalWrite(SENSOR_EN, LOW);
     analogReference(AR_DEFAULT);  // put back to default
     analogReadResolution(10);
 
@@ -60,10 +55,6 @@ public:
 
     #ifdef BUZZER_EN
         digitalWrite(BUZZER_EN, LOW);
-    #endif
-
-    #ifdef PIN_3V3_EN
-        digitalWrite(PIN_3V3_EN, LOW);
     #endif
 
     #ifdef PIN_3V3_ACC_EN

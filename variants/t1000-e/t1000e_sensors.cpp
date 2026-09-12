@@ -71,7 +71,6 @@ static int get_light_lv(unsigned int light_volt) {
 float t1000e_get_temperature(void) {
   unsigned int ntc_v, vcc_v;
 
-  digitalWrite(PIN_3V3_EN, HIGH);
   digitalWrite(SENSOR_EN, HIGH);
   analogReference(AR_INTERNAL_3_0);
   analogReadResolution(12);
@@ -79,8 +78,11 @@ float t1000e_get_temperature(void) {
   unsigned int rail_v = (1000.0 * (analogRead(BATTERY_PIN) * ADC_MULTIPLIER * AREF_VOLTAGE)) / 4096;
   vcc_v = (rail_v > NTC_REF_VCC) ? NTC_REF_VCC : rail_v;
   ntc_v = (1000.0 * AREF_VOLTAGE * analogRead(TEMP_SENSOR)) / 4096;
-  digitalWrite(PIN_3V3_EN, LOW);
   digitalWrite(SENSOR_EN, LOW);
+
+  // Reset ADC configuration to safe default state
+  analogReference(AR_DEFAULT);
+  analogReadResolution(10);
 
   return get_heater_temperature(vcc_v, ntc_v);
 }
@@ -89,7 +91,6 @@ uint32_t t1000e_get_light(void) {
   int lux = 0;
   unsigned int lux_v = 0;
 
-  digitalWrite(PIN_3V3_EN, HIGH);
   digitalWrite(SENSOR_EN, HIGH);
   analogReference(AR_INTERNAL_3_0);
   analogReadResolution(12);
@@ -97,7 +98,10 @@ uint32_t t1000e_get_light(void) {
   lux_v = 1000 * analogRead(LUX_SENSOR) * AREF_VOLTAGE / 4096;
   lux = get_light_lv(lux_v);
   digitalWrite(SENSOR_EN, LOW);
-  digitalWrite(PIN_3V3_EN, LOW);
+
+  // Reset ADC configuration to safe default state
+  analogReference(AR_DEFAULT);
+  analogReadResolution(10);
 
   return lux;
 }
