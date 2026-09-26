@@ -68,6 +68,10 @@ static void applyRxPowerSavingConfig(NodePrefs& prefs, uint8_t sf, float bw) {
   #define SENSOR_READ_INTERVAL_SECS  60
 #endif
 
+#ifndef GPS_READ_INTERVAL_SECS
+  #define GPS_READ_INTERVAL_SECS  60
+#endif
+
 /* ------------------------------ Code -------------------------------- */
 
 #define FIRMWARE_VER_LEVEL       1
@@ -203,7 +207,9 @@ uint8_t SensorMesh::handleRequest(uint8_t perms, uint32_t sender_timestamp, uint
     telemetry.reset();
     telemetry.addVoltage(TELEM_CHANNEL_SELF, (float)board.getBattMilliVolts() / 1000.0f);
     // query other sensors -- target specific
-    if (sensors.getLocationProvider() != NULL && sensors.getLocationProvider()->isPowerSavingEnabled()) {
+    if (sensors.getLocationProvider() != NULL &&
+        sensors.getLocationProvider()->isPowerSavingEnabled() &&
+        getRTCClock()->getCurrentTime() > sensors.getLocationProvider()->getLastValidTimeSync() + GPS_READ_INTERVAL_SECS) {
       sensors.getLocationProvider()->syncTime(); // Request for GPS sync if GPS is in PowerSaving
     }
     sensors.querySensors(0xFF & perm_mask, telemetry);  // allow all telemetry permissions for admin or guest
@@ -966,7 +972,7 @@ void SensorMesh::loop() {
     telemetry.reset();
     telemetry.addVoltage(TELEM_CHANNEL_SELF, (float)board.getBattMilliVolts() / 1000.0f);
     // query other sensors -- target specific
-    sensors.querySensors(0xFF, telemetry);  // allow all telemetry permissions
+    sensors.querySensors(TELEM_PERM_BASE || TELEM_PERM_ENVIRONMENT, telemetry);  // allow basic & environment telemetry permissions (no location)
 
     onSensorDataRead();
 
