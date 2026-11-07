@@ -96,9 +96,27 @@ static SensirionI2cSht4x SHT4X;
 LPS22HBClass LPS22HB(*TELEM_WIRE);
 #endif
 
+// ============================================================
+// INA family (TI current/power monitors)
+//
+// All INA2xx parts share the 0x40-0x4F address range (INA3221:
+// 0x40-0x43), so the address alone cannot tell which chip is
+// present. By default each INA type scans its full range and the
+// chip type is confirmed through its ID registers (see
+// identifyINA() below).
+//
+// Defining TELEM_INAxxx_ADDRESS in build flags pins that type to
+// a single address. For INA219, which has no ID registers, a
+// pinned address also skips identification entirely.
+// ============================================================
+
 #if ENV_INCLUDE_INA3221
-#ifndef TELEM_INA3221_ADDRESS
-#define TELEM_INA3221_ADDRESS     0x42    // INA3221 3 channel current sensor I2C address
+#ifdef TELEM_INA3221_ADDRESS
+#define TELEM_INA3221_ADDR_FIRST  TELEM_INA3221_ADDRESS
+#define TELEM_INA3221_ADDR_LAST   TELEM_INA3221_ADDRESS
+#else
+#define TELEM_INA3221_ADDR_FIRST  0x40
+#define TELEM_INA3221_ADDR_LAST   0x43
 #endif
 #ifndef TELEM_INA3221_SHUNT_VALUE
 #define TELEM_INA3221_SHUNT_VALUE 0.100 // most variants will have a 0.1 ohm shunts
@@ -111,29 +129,64 @@ static Adafruit_INA3221 INA3221;
 #endif
 
 #if ENV_INCLUDE_INA219
-#ifndef TELEM_INA219_ADDRESS
-#define TELEM_INA219_ADDRESS    0x40      // INA219 single channel current sensor I2C address
+#ifdef TELEM_INA219_ADDRESS
+#define TELEM_INA219_ADDR_FIRST   TELEM_INA219_ADDRESS
+#define TELEM_INA219_ADDR_LAST    TELEM_INA219_ADDRESS
+#define TELEM_INA219_PINNED       1  // trust the configured address, no ID check possible
+#else
+#define TELEM_INA219_ADDR_FIRST   0x40
+#define TELEM_INA219_ADDR_LAST    0x4F
 #endif
 #include <Adafruit_INA219.h>
-static Adafruit_INA219 INA219(TELEM_INA219_ADDRESS);
+static Adafruit_INA219* ina219_dev = nullptr;  // created at runtime with the detected address
 #endif
 
 #if ENV_INCLUDE_INA260
-#ifndef TELEM_INA260_ADDRESS
-#define TELEM_INA260_ADDRESS    0x41      // INA260 single channel current sensor I2C address
+#ifdef TELEM_INA260_ADDRESS
+#define TELEM_INA260_ADDR_FIRST   TELEM_INA260_ADDRESS
+#define TELEM_INA260_ADDR_LAST    TELEM_INA260_ADDRESS
+#else
+#define TELEM_INA260_ADDR_FIRST   0x40
+#define TELEM_INA260_ADDR_LAST    0x4F
 #endif
 #include <Adafruit_INA260.h>
 static Adafruit_INA260 INA260;
 #endif
 
 #if ENV_INCLUDE_INA226
-#ifndef TELEM_INA226_ADDRESS
-#define TELEM_INA226_ADDRESS     0x44
+#ifdef TELEM_INA226_ADDRESS
+#define TELEM_INA226_ADDR_FIRST   TELEM_INA226_ADDRESS
+#define TELEM_INA226_ADDR_LAST    TELEM_INA226_ADDRESS
+#else
+#define TELEM_INA226_ADDR_FIRST   0x40
+#define TELEM_INA226_ADDR_LAST    0x4F
 #endif
-#define TELEM_INA226_SHUNT_VALUE 0.100
-#define TELEM_INA226_MAX_AMP     0.8
+#ifndef TELEM_INA226_SHUNT_VALUE
+#define TELEM_INA226_SHUNT_VALUE  0.100
+#endif
+#ifndef TELEM_INA226_MAX_AMP
+#define TELEM_INA226_MAX_AMP      0.8
+#endif
 #include <INA226.h>
-static INA226 INA226(TELEM_INA226_ADDRESS, TELEM_WIRE);
+static INA226* ina226_dev = nullptr;  // created at runtime with the detected address
+#endif
+
+#if ENV_INCLUDE_INA228
+#ifdef TELEM_INA228_ADDRESS
+#define TELEM_INA228_ADDR_FIRST   TELEM_INA228_ADDRESS
+#define TELEM_INA228_ADDR_LAST    TELEM_INA228_ADDRESS
+#else
+#define TELEM_INA228_ADDR_FIRST   0x40
+#define TELEM_INA228_ADDR_LAST    0x4F
+#endif
+#ifndef TELEM_INA228_SHUNT_VALUE
+#define TELEM_INA228_SHUNT_VALUE  0.015  // shunt resistor in ohm
+#endif
+#ifndef TELEM_INA228_MAX_AMP
+#define TELEM_INA228_MAX_AMP      10.0   // expected max current in A
+#endif
+#include <INA228.h>
+static INA228* ina228_dev = nullptr;  // created at runtime with the detected address
 #endif
 
 #if ENV_INCLUDE_MLX90614
@@ -242,12 +295,101 @@ static void scanI2CBus(TwoWire* wire, bool found[128]) {
 }
 
 // ============================================================
-// Per-sensor init and query functions
+// INA chip identification
+//
+// INA226 / INA260 / INA3221: Manufacturer ID at 0xFE, Die ID at 0xFF
+// INA228:                    Manufacturer ID at 0x3E, Die ID at 0x3F
+// INA219:                    no ID registers; recognized by its
+//                            config register value (0x399F), which
+//                            is both the power-on default and what
+//                            Adafruit's default calibration writes.
+//
+// Reading an unsupported register on another chip returns an
+// undefined value; the exact Die ID comparison rejects it.
+//
+// Results are cached per address, so each device in 0x40-0x4F is
+// probed at most once, and only when an INA table entry asks.
+// ============================================================
+
+#if ENV_INCLUDE_INA219 || ENV_INCLUDE_INA226 || ENV_INCLUDE_INA228 || ENV_INCLUDE_INA260 || ENV_INCLUDE_INA3221
+#define TELEM_HAS_INA 1
+#endif
+
+#ifdef TELEM_HAS_INA
+#define TELEM_INA_ADDR_BASE  0x40
+#define TELEM_INA_ADDR_COUNT 16
+
+#define TELEM_TI_MANUFACTURER_ID 0x5449  // "TI"
+
+enum InaType : uint8_t { INA_NONE, INA_219, INA_226, INA_228, INA_260, INA_3221 };
+
+static bool    ina_probed[TELEM_INA_ADDR_COUNT] = {};
+static InaType ina_type[TELEM_INA_ADDR_COUNT]   = {};
+
+// Read a 16-bit big-endian register using plain register-pointer protocol
+static bool readReg16(TwoWire* wire, uint8_t addr, uint8_t reg, uint16_t& out) {
+  wire->beginTransmission(addr);
+  wire->write(reg);
+  if (wire->endTransmission() != 0) return false;
+  if (wire->requestFrom(addr, (uint8_t)2) != 2) return false;
+  uint8_t hi = wire->read();  // read separately: evaluation order matters
+  uint8_t lo = wire->read();
+  out = ((uint16_t)hi << 8) | lo;
+  return true;
+}
+
+static InaType identifyINA(TwoWire* wire, uint8_t addr) {
+  uint16_t mfg = 0, die = 0;
+
+  // INA226 / INA260 / INA3221
+  if (readReg16(wire, addr, 0xFE, mfg) && mfg == TELEM_TI_MANUFACTURER_ID) {
+    readReg16(wire, addr, 0xFF, die);
+    switch (die & 0xFFF0) {            // ignore revision nibble
+      case 0x2260: return INA_226;
+      case 0x2270: return INA_260;
+      case 0x3220: return (addr <= 0x43) ? INA_3221 : INA_NONE;
+    }
+  }
+
+  // INA228 (INA237/238 use the same ID layout but are not supported yet)
+  if (readReg16(wire, addr, 0x3E, mfg) && mfg == TELEM_TI_MANUFACTURER_ID) {
+    readReg16(wire, addr, 0x3F, die);
+    switch (die & 0xFFF0) {            // ignore revision nibble
+      case 0x2280: return INA_228;
+    }
+  }
+
+  // INA219 fallback
+  uint16_t cfg = 0;
+  if (readReg16(wire, addr, 0x00, cfg) && cfg == 0x399F) return INA_219;
+
+  return INA_NONE;
+}
+
+static InaType getINAType(TwoWire* wire, uint8_t addr) {
+  if (addr < TELEM_INA_ADDR_BASE || addr >= TELEM_INA_ADDR_BASE + TELEM_INA_ADDR_COUNT) return INA_NONE;
+  const uint8_t idx = addr - TELEM_INA_ADDR_BASE;
+  if (!ina_probed[idx]) {
+    ina_type[idx]   = identifyINA(wire, addr);
+    ina_probed[idx] = true;
+    MESH_DEBUG_PRINTLN("INA identify at %02X: type %d", addr, (int)ina_type[idx]);
+  }
+  return ina_type[idx];
+}
+#endif // TELEM_HAS_INA
+
+// ============================================================
+// Per-sensor match, init and query functions
+//
+// match(wire, address) — optional. Called for each detected
+//   address in the entry's range before init(). Returns true if
+//   the device at that address is this sensor type. A nullptr
+//   match means an ACK on the address is enough.
 //
 // init(wire, address) — called only when the address was seen
-//   on the bus. Returns 0 on failure, or the number of
-//   telemetry channels the sensor will consume (1 for all
-//   single-output sensors; INA3221 returns one per enabled
+//   on the bus (and match() passed). Returns 0 on failure, or the
+//   number of telemetry channels the sensor will consume (1 for
+//   all single-output sensors; INA3221 returns one per enabled
 //   hardware channel; MLX90614 and RAK12035+calibration
 //   return 2).
 //
@@ -360,6 +502,9 @@ static void query_lps22hb(uint8_t ch, uint8_t, CayenneLPP& lpp) {
 #endif
 
 #if ENV_INCLUDE_INA3221
+static bool match_ina3221(TwoWire* wire, uint8_t addr) {
+  return getINAType(wire, addr) == INA_3221;
+}
 static uint8_t init_ina3221(TwoWire* wire, uint8_t addr) {
   if (!INA3221.begin(addr, wire)) return 0;
   for (int i = 0; i < TELEM_INA3221_NUM_CHANNELS; i++) {
@@ -392,18 +537,33 @@ static void query_ina3221(uint8_t ch, uint8_t sub_ch, CayenneLPP& lpp) {
 #endif
 
 #if ENV_INCLUDE_INA219
-static uint8_t init_ina219(TwoWire* wire, uint8_t) {
-  // INA219 static instance was constructed with the address; begin() uses it.
-  return INA219.begin(wire) ? 1 : 0;
+#ifdef TELEM_INA219_PINNED
+#define TELEM_INA219_MATCH nullptr  // pinned address: skip identification
+#else
+static bool match_ina219(TwoWire* wire, uint8_t addr) {
+  return getINAType(wire, addr) == INA_219;
+}
+#define TELEM_INA219_MATCH match_ina219
+#endif
+static uint8_t init_ina219(TwoWire* wire, uint8_t addr) {
+  // Only keep the instance if begin() succeeds, so a failed attempt
+  // at one address cannot leave a stale instance for the next one.
+  Adafruit_INA219* dev = new Adafruit_INA219(addr);
+  if (!dev->begin(wire)) { delete dev; return 0; }
+  ina219_dev = dev;
+  return 1;
 }
 static void query_ina219(uint8_t ch, uint8_t, CayenneLPP& lpp) {
-  lpp.addVoltage(ch, INA219.getBusVoltage_V());
-  lpp.addCurrent(ch, INA219.getCurrent_mA() / 1000.0f);
-  lpp.addPower(ch, INA219.getPower_mW() / 1000.0f);
+  lpp.addVoltage(ch, ina219_dev->getBusVoltage_V());
+  lpp.addCurrent(ch, ina219_dev->getCurrent_mA() / 1000.0f);
+  lpp.addPower(ch, ina219_dev->getPower_mW() / 1000.0f);
 }
 #endif
 
 #if ENV_INCLUDE_INA260
+static bool match_ina260(TwoWire* wire, uint8_t addr) {
+  return getINAType(wire, addr) == INA_260;
+}
 static uint8_t init_ina260(TwoWire* wire, uint8_t addr) {
   return INA260.begin(addr, wire) ? 1 : 0;
 }
@@ -415,16 +575,39 @@ static void query_ina260(uint8_t ch, uint8_t, CayenneLPP& lpp) {
 #endif
 
 #if ENV_INCLUDE_INA226
-static uint8_t init_ina226(TwoWire*, uint8_t) {
-  // INA226 static instance was constructed with address and wire.
-  if (!INA226.begin()) return 0;
-  INA226.setMaxCurrentShunt(TELEM_INA226_MAX_AMP, TELEM_INA226_SHUNT_VALUE);
+static bool match_ina226(TwoWire* wire, uint8_t addr) {
+  return getINAType(wire, addr) == INA_226;
+}
+static uint8_t init_ina226(TwoWire* wire, uint8_t addr) {
+  INA226* dev = new INA226(addr, wire);
+  if (!dev->begin()) { delete dev; return 0; }
+  dev->setMaxCurrentShunt(TELEM_INA226_MAX_AMP, TELEM_INA226_SHUNT_VALUE);
+  ina226_dev = dev;
   return 1;
 }
 static void query_ina226(uint8_t ch, uint8_t, CayenneLPP& lpp) {
-  lpp.addVoltage(ch, INA226.getBusVoltage());
-  lpp.addCurrent(ch, INA226.getCurrent_mA() / 1000.0f);
-  lpp.addPower(ch, INA226.getPower_mW() / 1000.0f);
+  lpp.addVoltage(ch, ina226_dev->getBusVoltage());
+  lpp.addCurrent(ch, ina226_dev->getCurrent_mA() / 1000.0f);
+  lpp.addPower(ch, ina226_dev->getPower_mW() / 1000.0f);
+}
+#endif
+
+#if ENV_INCLUDE_INA228
+static bool match_ina228(TwoWire* wire, uint8_t addr) {
+  return getINAType(wire, addr) == INA_228;
+}
+static uint8_t init_ina228(TwoWire* wire, uint8_t addr) {
+  INA228* dev = new INA228(addr, wire);
+  if (!dev->begin()) { delete dev; return 0; }
+  dev->setMaxCurrentShunt(TELEM_INA228_MAX_AMP, TELEM_INA228_SHUNT_VALUE);
+  ina228_dev = dev;
+  return 1;
+}
+static void query_ina228(uint8_t ch, uint8_t, CayenneLPP& lpp) {
+  lpp.addVoltage(ch, ina228_dev->getBusVoltage());  // V
+  lpp.addCurrent(ch, ina228_dev->getCurrent());     // A
+  lpp.addPower(ch, ina228_dev->getPower());         // W
+  lpp.addEnergy(ch, ina228_dev->getEnergy() / 3600.0f); // unit is Wh, lpp displays kWh
 }
 #endif
 
@@ -551,12 +734,14 @@ static void query_bme680_bsec(uint8_t ch, uint8_t, CayenneLPP& lpp) {
 // ============================================================
 // Sensor descriptor table
 //
-// Each entry maps an I2C address to a sensor's init and query
-// functions. Only entries whose ENV_INCLUDE_* guard is defined
-// are compiled in. The sentinel at the end keeps the array
-// non-empty regardless of which sensors are enabled.
+// Each entry maps an I2C address range to a sensor's match, init
+// and query functions. Only entries whose ENV_INCLUDE_* guard is
+// defined are compiled in. The sentinel at the end keeps the
+// array non-empty regardless of which sensors are enabled.
 //
-// Bosch BMP/BME SDO selects 0x76 or 0x77; probe both.
+// Fixed-address sensors use TELEM_ADDR(addr), i.e. a range of one.
+// Bosch BMP/BME SDO selects 0x76 or 0x77; probe both, configured
+// address first.
 //
 // Ordering here determines channel assignment at runtime:
 // the first detected+initialized sensor gets channel 2, the
@@ -564,71 +749,79 @@ static void query_bme680_bsec(uint8_t ch, uint8_t, CayenneLPP& lpp) {
 // ============================================================
 
 struct SensorDef {
-  uint8_t     address;
+  uint8_t     addr_first;
+  uint8_t     addr_last;
   const char* name;
+  bool      (*match)(TwoWire* wire, uint8_t address);  // nullptr = address ACK is enough
   uint8_t   (*init)(TwoWire* wire, uint8_t address);
   void      (*query)(uint8_t channel, uint8_t sub_channel, CayenneLPP& telemetry);
 };
 
+#define TELEM_ADDR(addr) (uint8_t)(addr), (uint8_t)(addr)
 #define TELEM_BOSCH_ALT_ADDR(addr) ((uint8_t)((addr) == 0x76 ? 0x77 : 0x76))
 
 static const SensorDef SENSOR_TABLE[] = {
 #if ENV_INCLUDE_AHTX0
-  { TELEM_AHTX_ADDRESS,    "AHT10/AHT20", init_ahtx0,    query_ahtx0    },
+  { TELEM_ADDR(TELEM_AHTX_ADDRESS),                       "AHT10/AHT20", nullptr, init_ahtx0,       query_ahtx0       },
 #endif
 #ifdef ENV_INCLUDE_BME680
-  { TELEM_BME680_ADDRESS,                       "BME680",       init_bme680,      query_bme680      },
-  { TELEM_BOSCH_ALT_ADDR(TELEM_BME680_ADDRESS), "BME680",       init_bme680,      query_bme680      },
+  { TELEM_ADDR(TELEM_BME680_ADDRESS),                     "BME680",      nullptr, init_bme680,      query_bme680      },
+  { TELEM_ADDR(TELEM_BOSCH_ALT_ADDR(TELEM_BME680_ADDRESS)), "BME680",    nullptr, init_bme680,      query_bme680      },
 #endif
 #if ENV_INCLUDE_BME680_BSEC
-  { TELEM_BME680_ADDRESS,                       "BME680+BSEC",  init_bme680_bsec, query_bme680_bsec },
-  { TELEM_BOSCH_ALT_ADDR(TELEM_BME680_ADDRESS), "BME680+BSEC",  init_bme680_bsec, query_bme680_bsec },
+  { TELEM_ADDR(TELEM_BME680_ADDRESS),                     "BME680+BSEC", nullptr, init_bme680_bsec, query_bme680_bsec },
+  { TELEM_ADDR(TELEM_BOSCH_ALT_ADDR(TELEM_BME680_ADDRESS)), "BME680+BSEC", nullptr, init_bme680_bsec, query_bme680_bsec },
 #endif
 #if ENV_INCLUDE_BME280
-  { TELEM_BME280_ADDRESS,                       "BME280",       init_bme280,      query_bme280      },
-  { TELEM_BOSCH_ALT_ADDR(TELEM_BME280_ADDRESS), "BME280",       init_bme280,      query_bme280      },
+  { TELEM_ADDR(TELEM_BME280_ADDRESS),                     "BME280",      nullptr, init_bme280,      query_bme280      },
+  { TELEM_ADDR(TELEM_BOSCH_ALT_ADDR(TELEM_BME280_ADDRESS)), "BME280",    nullptr, init_bme280,      query_bme280      },
 #endif
 #if ENV_INCLUDE_BMP280
-  { TELEM_BMP280_ADDRESS,                       "BMP280",       init_bmp280,      query_bmp280      },
-  { TELEM_BOSCH_ALT_ADDR(TELEM_BMP280_ADDRESS), "BMP280",       init_bmp280,      query_bmp280      },
+  { TELEM_ADDR(TELEM_BMP280_ADDRESS),                     "BMP280",      nullptr, init_bmp280,      query_bmp280      },
+  { TELEM_ADDR(TELEM_BOSCH_ALT_ADDR(TELEM_BMP280_ADDRESS)), "BMP280",    nullptr, init_bmp280,      query_bmp280      },
 #endif
 #if ENV_INCLUDE_SHTC3
-  { 0x70,                  "SHTC3",        init_shtc3,    query_shtc3    },
+  { TELEM_ADDR(0x70),                                     "SHTC3",       nullptr, init_shtc3,       query_shtc3       },
 #endif
 #if ENV_INCLUDE_SHT4X
-  { TELEM_SHT4X_ADDRESS,   "SHT4X",        init_sht4x,    query_sht4x    },
+  // Must stay before the INA entries: SHT4X shares 0x44/0x45 with the INA range.
+  { TELEM_ADDR(TELEM_SHT4X_ADDRESS),                      "SHT4X",       nullptr, init_sht4x,       query_sht4x       },
 #endif
 #if ENV_INCLUDE_LPS22HB
-  { 0x5C,                  "LPS22HB",      init_lps22hb,  query_lps22hb  },
+  { TELEM_ADDR(0x5C),                                     "LPS22HB",     nullptr, init_lps22hb,     query_lps22hb     },
 #endif
 #if ENV_INCLUDE_INA3221
-  { TELEM_INA3221_ADDRESS, "INA3221",      init_ina3221,  query_ina3221  },
+  { TELEM_INA3221_ADDR_FIRST, TELEM_INA3221_ADDR_LAST,    "INA3221",     match_ina3221,      init_ina3221, query_ina3221 },
 #endif
 #if ENV_INCLUDE_INA219
-  { TELEM_INA219_ADDRESS,  "INA219",       init_ina219,   query_ina219   },
+  { TELEM_INA219_ADDR_FIRST,  TELEM_INA219_ADDR_LAST,     "INA219",      TELEM_INA219_MATCH, init_ina219,  query_ina219  },
 #endif
 #if ENV_INCLUDE_INA260
-  { TELEM_INA260_ADDRESS,  "INA260",       init_ina260,   query_ina260   },
+  { TELEM_INA260_ADDR_FIRST,  TELEM_INA260_ADDR_LAST,     "INA260",      match_ina260,       init_ina260,  query_ina260  },
 #endif
 #if ENV_INCLUDE_INA226
-  { TELEM_INA226_ADDRESS,  "INA226",       init_ina226,   query_ina226   },
+  { TELEM_INA226_ADDR_FIRST,  TELEM_INA226_ADDR_LAST,     "INA226",      match_ina226,       init_ina226,  query_ina226  },
+#endif
+#if ENV_INCLUDE_INA228
+  { TELEM_INA228_ADDR_FIRST,  TELEM_INA228_ADDR_LAST,     "INA228",      match_ina228,       init_ina228,  query_ina228  },
 #endif
 #if ENV_INCLUDE_MLX90614
-  { TELEM_MLX90614_ADDRESS,"MLX90614",     init_mlx90614, query_mlx90614 },
+  { TELEM_ADDR(TELEM_MLX90614_ADDRESS),                   "MLX90614",    nullptr, init_mlx90614,    query_mlx90614    },
 #endif
 #if ENV_INCLUDE_VL53L0X
-  { TELEM_VL53L0X_ADDRESS, "VL53L0X",      init_vl53l0x,  query_vl53l0x  },
+  { TELEM_ADDR(TELEM_VL53L0X_ADDRESS),                    "VL53L0X",     nullptr, init_vl53l0x,     query_vl53l0x     },
 #endif
 #ifdef ENV_INCLUDE_BMP085
-  { 0x77,                  "BMP085",       init_bmp085,   query_bmp085   },
+  { TELEM_ADDR(0x77),                                     "BMP085",      nullptr, init_bmp085,      query_bmp085      },
 #endif
 #if ENV_INCLUDE_RAK12035
-  { TELEM_RAK12035_ADDRESS,"RAK12035",     init_rak12035, query_rak12035 },
+  { TELEM_ADDR(TELEM_RAK12035_ADDRESS),                   "RAK12035",    nullptr, init_rak12035,    query_rak12035    },
 #endif
-  { 0, nullptr, nullptr, nullptr }  // sentinel — keeps the array non-empty
+  { 0, 0, nullptr, nullptr, nullptr, nullptr }  // sentinel — keeps the array non-empty
 };
 
 #undef TELEM_BOSCH_ALT_ADDR
+#undef TELEM_ADDR
 
 static const size_t SENSOR_TABLE_SIZE = (sizeof(SENSOR_TABLE) / sizeof(SENSOR_TABLE[0])) - 1;
 
@@ -673,19 +866,36 @@ bool EnvironmentSensorManager::begin() {
       if (_active_sensors[j].query == def.query) { already_active = true; break; }
     }
     if (already_active) continue;
-    if (!detected[def.address]) {
-      MESH_DEBUG_PRINTLN("%s not detected at I2C address %02X", def.name, def.address);
-      continue;
+
+    // Try each detected address in the entry's range; the first one that
+    // matches and initializes wins. uint16_t avoids wrap-around at 0xFF.
+    bool candidate_seen = false;
+    bool initialized    = false;
+    for (uint16_t a = def.addr_first; a <= def.addr_last && !initialized; a++) {
+      const uint8_t addr = (uint8_t)a;
+      if (!detected[addr]) continue;
+      if (def.match && !def.match(TELEM_WIRE, addr)) continue;
+      candidate_seen = true;
+
+      uint8_t n = def.init(TELEM_WIRE, addr);
+      if (n == 0) {
+        MESH_DEBUG_PRINTLN("%s found at %02X but failed to initialize", def.name, addr);
+        continue;
+      }
+      MESH_DEBUG_PRINTLN("Found %s at address: %02X", def.name, addr);
+      detected[addr] = false;  // consumed; later entries must not re-claim this device
+      for (uint8_t sub = 0; sub < n && _active_sensor_count < MAX_ACTIVE_SENSORS; sub++) {
+        _active_sensors[_active_sensor_count++] = { def.query, sub };
+      }
+      initialized = true;
     }
-    uint8_t n = def.init(TELEM_WIRE, def.address);
-    if (n == 0) {
-      MESH_DEBUG_PRINTLN("%s found at %02X but failed to initialize", def.name, def.address);
-      continue;
-    }
-    MESH_DEBUG_PRINTLN("Found %s at address: %02X", def.name, def.address);
-    detected[def.address] = false;  // consumed; later entries must not re-claim this device
-    for (uint8_t sub = 0; sub < n && _active_sensor_count < MAX_ACTIVE_SENSORS; sub++) {
-      _active_sensors[_active_sensor_count++] = { def.query, sub };
+
+    if (!candidate_seen) {
+      if (def.addr_first == def.addr_last) {
+        MESH_DEBUG_PRINTLN("%s not detected at I2C address %02X", def.name, def.addr_first);
+      } else {
+        MESH_DEBUG_PRINTLN("%s not detected in I2C range %02X-%02X", def.name, def.addr_first, def.addr_last);
+      }
     }
   }
 
